@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Harshmaury/Canon/identity"
 	"github.com/Harshmaury/Metrics/internal/snapshot"
 )
 
@@ -31,26 +32,33 @@ func NewForgeCollector(baseURL, serviceToken string) *ForgeCollector {
 }
 
 // Collect fetches recent execution records and computes ForgeMetrics.
-func (c *ForgeCollector) Collect(ctx context.Context) snapshot.ForgeMetrics {
+// traceID is the collection-cycle trace ID for X-Trace-ID propagation (FEAT-002).
+func (c *ForgeCollector) Collect(ctx context.Context, traceID string) snapshot.ForgeMetrics {
+	empty := snapshot.ForgeMetrics{Available: false, TopTargets: map[string]int{}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("%s/history?limit=%d", c.baseURL, forgeHistoryLimit), nil)
 	if err != nil {
-		return snapshot.ForgeMetrics{Available: false, TopTargets: map[string]int{}}
+		return empty
 	}
 	if c.serviceToken != "" {
-		req.Header.Set("X-Service-Token", c.serviceToken)
+		req.Header.Set(identity.ServiceTokenHeader, c.serviceToken)
 	}
-
+	if traceID != "" {
+		req.Header.Set(identity.TraceIDHeader, traceID)
+	}
 	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return snapshot.ForgeMetrics{Available: false, TopTargets: map[string]int{}}
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return empty
 	}
 	defer resp.Body.Close()
+	return computeForgeMetrics(resp)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return snapshot.ForgeMetrics{Available: false, TopTargets: map[string]int{}}
-	}
-
+// computeForgeMetrics decodes the Forge /history response and aggregates stats.
+func computeForgeMetrics(resp *http.Response) snapshot.ForgeMetrics {
 	var envelope struct {
 		OK   bool `json:"ok"`
 		Data []struct {
@@ -62,12 +70,7 @@ func (c *ForgeCollector) Collect(ctx context.Context) snapshot.ForgeMetrics {
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return snapshot.ForgeMetrics{Available: false, TopTargets: map[string]int{}}
 	}
-
-	m := snapshot.ForgeMetrics{
-		Available:  true,
-		TopTargets: map[string]int{},
-	}
-
+	m := snapshot.ForgeMetrics{Available: true, TopTargets: map[string]int{}}
 	var totalDuration int64
 	for _, r := range envelope.Data {
 		m.TotalExecutions++
@@ -82,7 +85,6 @@ func (c *ForgeCollector) Collect(ctx context.Context) snapshot.ForgeMetrics {
 			m.DeniedCount++
 		}
 	}
-
 	if m.TotalExecutions > 0 {
 		m.AvgDurationMS = float64(totalDuration) / float64(m.TotalExecutions)
 	}

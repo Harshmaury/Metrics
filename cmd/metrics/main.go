@@ -13,6 +13,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -39,37 +41,63 @@ func main() {
 	logger.Println("Metrics stopped cleanly")
 }
 
-func run(logger *log.Logger) error {
-	// ── 1. CONFIG ────────────────────────────────────────────────────────────
-	httpAddr     := config.EnvOrDefault("METRICS_HTTP_ADDR", config.DefaultHTTPAddr)
-	nexusAddr    := config.EnvOrDefault("NEXUS_HTTP_ADDR", config.DefaultNexusAddr)
-	atlasAddr    := config.EnvOrDefault("ATLAS_HTTP_ADDR", config.DefaultAtlasAddr)
-	forgeAddr    := config.EnvOrDefault("FORGE_HTTP_ADDR", config.DefaultForgeAddr)
-	serviceToken := config.EnvOrDefault("METRICS_SERVICE_TOKEN", "")
-	if serviceToken == "" {
+// metricsConfig holds resolved runtime configuration.
+type metricsConfig struct {
+	httpAddr     string
+	nexusAddr    string
+	atlasAddr    string
+	forgeAddr    string
+	serviceToken string
+}
+
+// loadConfig reads environment variables and logs warnings.
+func loadConfig(logger *log.Logger) metricsConfig {
+	cfg := metricsConfig{
+		httpAddr:     config.EnvOrDefault("METRICS_HTTP_ADDR", config.DefaultHTTPAddr),
+		nexusAddr:    config.EnvOrDefault("NEXUS_HTTP_ADDR", config.DefaultNexusAddr),
+		atlasAddr:    config.EnvOrDefault("ATLAS_HTTP_ADDR", config.DefaultAtlasAddr),
+		forgeAddr:    config.EnvOrDefault("FORGE_HTTP_ADDR", config.DefaultForgeAddr),
+		serviceToken: config.EnvOrDefault("METRICS_SERVICE_TOKEN", ""),
+	}
+	if cfg.serviceToken == "" {
 		logger.Println("WARNING: METRICS_SERVICE_TOKEN not set — upstream auth disabled")
 	}
+	return cfg
+}
+
+func run(logger *log.Logger) error {
+	cfg := loadConfig(logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// ── 2. COLLECTORS ────────────────────────────────────────────────────────
-	nexusColl := collector.NewNexusCollector(nexusAddr, serviceToken)
-	forgeColl := collector.NewForgeCollector(forgeAddr, serviceToken)
-	atlasColl := collector.NewAtlasCollector(atlasAddr, serviceToken)
+	nexusColl := collector.NewNexusCollector(cfg.nexusAddr, cfg.serviceToken)
+	forgeColl := collector.NewForgeCollector(cfg.forgeAddr, cfg.serviceToken)
+	atlasColl := collector.NewAtlasCollector(cfg.atlasAddr, cfg.serviceToken)
+	snapStore  := handler.NewSnapshotStore()
 
-	// ── 3. SNAPSHOT STORE ─────────────────────────────────────────────────────
-	snapStore := handler.NewSnapshotStore()
-
-	// ── 4. INITIAL COLLECTION ────────────────────────────────────────────────
 	collectAll(ctx, nexusColl, forgeColl, atlasColl, snapStore, logger)
 	logger.Printf("✓ Metrics ready — http=%s nexus=%s atlas=%s forge=%s",
-		httpAddr, nexusAddr, atlasAddr, forgeAddr)
+		cfg.httpAddr, cfg.nexusAddr, cfg.atlasAddr, cfg.forgeAddr)
 
-	// ── 5. HTTP SERVER ───────────────────────────────────────────────────────
-	srv := api.NewServer(httpAddr, snapStore, logger)
+	return serveAndWait(ctx, cancel, sigCh, cfg.httpAddr,
+		snapStore, nexusColl, forgeColl, atlasColl, logger)
+}
 
+// serveAndWait starts the HTTP server and polling loop, blocks until shutdown.
+func serveAndWait(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	sigCh <-chan os.Signal,
+	httpAddr string,
+	snapStore *handler.SnapshotStore,
+	nexusColl *collector.NexusCollector,
+	forgeColl *collector.ForgeCollector,
+	atlasColl *collector.AtlasCollector,
+	logger *log.Logger,
+) error {
+	srv  := api.NewServer(httpAddr, snapStore, logger)
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
 
@@ -81,32 +109,9 @@ func run(logger *log.Logger) error {
 		}
 	}()
 
-	// ── 6. POLLING LOOPS ─────────────────────────────────────────────────────
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		nexusTick  := time.NewTicker(5 * time.Second)
-		forgeTick  := time.NewTicker(10 * time.Second)
-		atlasTick  := time.NewTicker(30 * time.Second)
-		defer nexusTick.Stop()
-		defer forgeTick.Stop()
-		defer atlasTick.Stop()
+	go startPollingLoop(ctx, &wg, nexusColl, forgeColl, atlasColl, snapStore, logger)
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-nexusTick.C:
-				collectAll(ctx, nexusColl, forgeColl, atlasColl, snapStore, logger)
-			case <-forgeTick.C:
-				collectAll(ctx, nexusColl, forgeColl, atlasColl, snapStore, logger)
-			case <-atlasTick.C:
-				collectAll(ctx, nexusColl, forgeColl, atlasColl, snapStore, logger)
-			}
-		}
-	}()
-
-	// ── WAIT FOR SHUTDOWN ─────────────────────────────────────────────────────
 	select {
 	case sig := <-sigCh:
 		logger.Printf("received %s — shutting down", sig)
@@ -121,16 +126,66 @@ func run(logger *log.Logger) error {
 	return nil
 }
 
-// collectAll runs all collectors and updates the snapshot store.
-func collectAll(ctx context.Context, nexusColl *collector.NexusCollector, forgeColl *collector.ForgeCollector, atlasColl *collector.AtlasCollector, store *handler.SnapshotStore, logger *log.Logger) {
+// startPollingLoop runs staggered collection tickers until ctx is cancelled.
+func startPollingLoop(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	nexusColl *collector.NexusCollector,
+	forgeColl *collector.ForgeCollector,
+	atlasColl *collector.AtlasCollector,
+	store *handler.SnapshotStore,
+	logger *log.Logger,
+) {
+	defer wg.Done()
+	nexusTick := time.NewTicker(5 * time.Second)
+	forgeTick := time.NewTicker(10 * time.Second)
+	atlasTick := time.NewTicker(30 * time.Second)
+	defer nexusTick.Stop()
+	defer forgeTick.Stop()
+	defer atlasTick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-nexusTick.C:
+			collectAll(ctx, nexusColl, forgeColl, atlasColl, store, logger)
+		case <-forgeTick.C:
+			collectAll(ctx, nexusColl, forgeColl, atlasColl, store, logger)
+		case <-atlasTick.C:
+			collectAll(ctx, nexusColl, forgeColl, atlasColl, store, logger)
+		}
+	}
+}
+
+// collectAll runs all collectors under a single trace ID and atomically
+// replaces the snapshot store (FEAT-002).
+func collectAll(
+	ctx context.Context,
+	nexusColl *collector.NexusCollector,
+	forgeColl *collector.ForgeCollector,
+	atlasColl *collector.AtlasCollector,
+	store *handler.SnapshotStore,
+	logger *log.Logger,
+) {
+	traceID := newTraceID()
 	snap := &snapshot.Snapshot{
 		CollectedAt: time.Now().UTC(),
-		Nexus:       nexusColl.CollectMetrics(ctx),
-		Events:      nexusColl.CollectEvents(ctx),
-		Forge:       forgeColl.Collect(ctx),
-		Atlas:       atlasColl.Collect(ctx),
+		Nexus:       nexusColl.CollectMetrics(ctx, traceID),
+		Events:      nexusColl.CollectEvents(ctx, traceID),
+		Forge:       forgeColl.Collect(ctx, traceID),
+		Atlas:       atlasColl.Collect(ctx, traceID),
 	}
 	store.Set(snap)
-	logger.Printf("snapshot collected — nexus=%v atlas=%v forge=%v",
-		snap.Nexus.Available, snap.Atlas.Available, snap.Forge.Available)
+	logger.Printf("snapshot trace=%s nexus=%v atlas=%v forge=%v",
+		traceID, snap.Nexus.Available, snap.Atlas.Available, snap.Forge.Available)
+}
+
+// newTraceID generates a random trace ID for collection cycles (FEAT-002).
+func newTraceID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("mt-%d", time.Now().UnixNano())
+	}
+	return "mt-" + hex.EncodeToString(b)
 }
