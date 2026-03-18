@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	nexusEventLimit  = 100
+	nexusEventLimit  = 500 // increased from 100 (ISSUE-006)
 	crashWindowMins  = 10
 	dropWindowMins   = 10
 )
