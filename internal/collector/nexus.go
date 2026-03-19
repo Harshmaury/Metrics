@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Harshmaury/Canon/events"
 	"github.com/Harshmaury/Canon/identity"
 	"github.com/Harshmaury/Metrics/internal/snapshot"
 )
@@ -134,11 +135,11 @@ func (c *NexusCollector) aggregateEvents(rows []struct {
 		}
 		if ts.After(cutoff) {
 			switch e.Type {
-			case "SERVICE_CRASHED":
+			case events.EventServiceCrashed:
 				m.RecentCrashes++
-			case "FILE_DROPPED":
+			case events.EventFileDropped:
 				m.RecentDrops++
-			case "FILE_ROUTED":
+			case events.EventFileRouted:
 				m.RecentRoutedFiles++
 			}
 		}
