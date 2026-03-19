@@ -1,7 +1,7 @@
 // @metrics-project: metrics
 // @metrics-path: internal/api/server.go
 // Metrics HTTP API server on 127.0.0.1:8083 (ADR-011).
-// Read-only — no auth required on snapshot endpoint.
+// Phase 2: added GET /metrics/prometheus endpoint (Prometheus text format).
 package api
 
 import (
@@ -26,11 +26,13 @@ func NewServer(addr string, store *handler.SnapshotStore, logger *log.Logger) *S
 		logger = log.Default()
 	}
 
-	snapshotH := handler.NewSnapshotHandler(store)
-	mux := http.NewServeMux()
+	snapshotH   := handler.NewSnapshotHandler(store)
+	prometheusH := handler.NewPrometheusHandler(store)
 
-	mux.HandleFunc("GET /health",           handleHealth)
-	mux.HandleFunc("GET /metrics/snapshot", snapshotH.Get)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health",             handleHealth)
+	mux.HandleFunc("GET /metrics/snapshot",   snapshotH.Get)
+	mux.HandleFunc("GET /metrics/prometheus", prometheusH.Get)
 
 	return &Server{
 		http: &http.Server{

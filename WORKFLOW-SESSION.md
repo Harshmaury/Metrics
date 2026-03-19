@@ -1,44 +1,45 @@
 # WORKFLOW-SESSION.md
-# Session: MT-phase1-metrics-observer
-# Date: 2026-03-17
+# Session: MT-phase2-prometheus
+# Date: 2026-03-19
 
-## What changed — Metrics Phase 1 (ADR-011)
+## What changed — Metrics Phase 2 (ADR-011 amendment)
 
-New observer service. Polls Nexus, Atlas, Forge and exposes
-GET /metrics/snapshot as a single platform health endpoint.
+GET /metrics/prometheus endpoint. Standard Prometheus text exposition format.
+No new dependencies — plain text generated from the existing Snapshot struct.
+Exposes 18 metrics under the engx_ prefix covering Nexus, Forge, Atlas, and events.
+Compatible with Prometheus, Grafana Agent, VictoriaMetrics, and any scraper.
 
-## New project: ~/workspace/projects/apps/metrics
+## New files
+- internal/api/handler/prometheus.go  — PrometheusHandler, 18 metrics, format helpers
 
-Files:
-- cmd/metrics/main.go
-- internal/config/env.go
-- internal/snapshot/model.go
-- internal/collector/nexus.go
-- internal/collector/forge.go
-- internal/collector/atlas.go
-- internal/api/handler/snapshot.go
-- internal/api/server.go
-- go.mod
-- nexus.yaml
+## Modified files
+- internal/api/server.go              — GET /metrics/prometheus route registered
 
-## Setup and run
+## Apply
 
 cd ~/workspace/projects/apps/metrics && \
-go mod tidy && \
-go build ./... && \
-METRICS_SERVICE_TOKEN=7d5fcbe4-44b9-4a8f-8b79-f80925c1330e metrics &
+unzip -o /mnt/c/Users/harsh/Downloads/engx-drop/metrics-phase2-prometheus-20260319.zip -d . && \
+go build ./...
 
 ## Verify
 
-curl -s http://127.0.0.1:8083/health
-curl -s http://127.0.0.1:8083/metrics/snapshot | jq '{nexus:.data.nexus.available, atlas:.data.atlas.available, forge:.data.forge.available}'
-curl -s http://127.0.0.1:8083/metrics/snapshot | jq '.data.nexus'
-curl -s http://127.0.0.1:8083/metrics/snapshot | jq '.data.atlas'
+go build ./...
+# Start metrics, then:
+curl -s http://127.0.0.1:8083/metrics/prometheus | head -20
+# Expected: # HELP engx_nexus_up ... # TYPE engx_nexus_up gauge
+
+# Prometheus scrape config:
+# - job_name: engx
+#   static_configs:
+#     - targets: ['127.0.0.1:8083']
+#   metrics_path: /metrics/prometheus
 
 ## Commit
 
-git init && git add . && \
-git commit -m "feat: metrics observer phase 1 (ADR-011)" && \
-git tag v0.1.0-phase1 && \
-git remote add origin git@github.com:Harshmaury/Metrics.git && \
-git push -u origin main --tags
+git add \
+  internal/api/handler/prometheus.go \
+  internal/api/server.go \
+  WORKFLOW-SESSION.md && \
+git commit -m "feat(phase2): GET /metrics/prometheus — Prometheus text format (ADR-011 amendment)" && \
+git tag v0.2.0-phase2 && \
+git push origin main --tags
