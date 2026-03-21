@@ -1,125 +1,68 @@
 // @metrics-project: metrics
 // @metrics-path: internal/collector/nexus.go
-// Package collector provides pollers for each upstream platform service.
-// All collectors are read-only (ADR-011).
+// ADR-039: complete Herald migration — /metrics endpoint now uses typed client.
+// Previously hybrid: events used Herald, /metrics used raw HTTP.
+// Now: both use Herald. Raw httpClient removed entirely.
 package collector
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/Harshmaury/Canon/events"
-	"github.com/Harshmaury/Canon/identity"
-	"github.com/Harshmaury/Metrics/internal/snapshot"
 	herald "github.com/Harshmaury/Herald/client"
+	"github.com/Harshmaury/Metrics/internal/snapshot"
 )
 
 const (
-	nexusEventLimit  = 500 // increased from 100 (ISSUE-006)
-	crashWindowMins  = 10
-	dropWindowMins   = 10
+	nexusEventLimit = 500
+	crashWindowMins = 10
 )
 
-// NexusCollector polls Nexus /events and /metrics.
-// ADR-039: events polling uses Herald; /metrics uses raw HTTP (no Herald client yet).
+// NexusCollector polls Nexus /events and /metrics via Herald.
 type NexusCollector struct {
-	baseURL      string
-	serviceToken string
-	httpClient   *http.Client
-	heraldClient *herald.Client
-	lastEventID  int64
+	nexus       *herald.Client
+	lastEventID int64
 }
 
 // NewNexusCollector creates a NexusCollector.
 func NewNexusCollector(baseURL, serviceToken string) *NexusCollector {
 	return &NexusCollector{
-		baseURL:      baseURL,
-		serviceToken: serviceToken,
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
-		heraldClient: herald.New(baseURL, herald.WithToken(serviceToken)),
+		nexus: herald.New(baseURL, herald.WithToken(serviceToken)),
 	}
 }
 
-// CollectMetrics fetches Nexus runtime counters from GET /metrics.
-// traceID is the collection-cycle trace ID for X-Trace-ID propagation (FEAT-002).
+// CollectMetrics fetches Nexus runtime counters via Herald.
 func (c *NexusCollector) CollectMetrics(ctx context.Context, traceID string) snapshot.NexusMetrics {
-	resp, err := c.get(ctx, "/metrics", traceID)
+	m, err := c.nexus.NexusMetrics().Get(ctx)
 	if err != nil {
-		return snapshot.NexusMetrics{Available: false}
-	}
-	defer resp.Body.Close()
-	return parseNexusMetrics(resp)
-}
-
-// parseNexusMetrics decodes the Nexus /metrics response body.
-func parseNexusMetrics(resp *http.Response) snapshot.NexusMetrics {
-	var raw struct {
-		UptimeSeconds         float64 `json:"uptime_seconds"`
-		ReconcileCyclesTotal  int64   `json:"reconcile_cycles_total"`
-		ServicesRunning       int64   `json:"services_running"`
-		ServicesInMaintenance int64   `json:"services_in_maintenance"`
-		ServicesStartedTotal  int64   `json:"services_started_total"`
-		ServicesStoppedTotal  int64   `json:"services_stopped_total"`
-		ServicesCrashedTotal  int64   `json:"services_crashed_total"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return snapshot.NexusMetrics{Available: false}
 	}
 	return snapshot.NexusMetrics{
 		Available:             true,
-		UptimeSeconds:         raw.UptimeSeconds,
-		ReconcileCyclesTotal:  raw.ReconcileCyclesTotal,
-		ServicesRunning:       raw.ServicesRunning,
-		ServicesInMaintenance: raw.ServicesInMaintenance,
-		ServicesStartedTotal:  raw.ServicesStartedTotal,
-		ServicesStoppedTotal:  raw.ServicesStoppedTotal,
-		ServicesCrashedTotal:  raw.ServicesCrashedTotal,
+		UptimeSeconds:         m.UptimeSeconds,
+		ReconcileCyclesTotal:  m.ReconcileCyclesTotal,
+		ServicesRunning:       m.ServicesRunning,
+		ServicesInMaintenance: m.ServicesInMaintenance,
+		ServicesStartedTotal:  m.ServicesStartedTotal,
+		ServicesStoppedTotal:  m.ServicesStoppedTotal,
+		ServicesCrashedTotal:  m.ServicesCrashedTotal,
 	}
 }
 
-// CollectEvents fetches recent events from GET /events?since=<id>.
-// traceID is the collection-cycle trace ID for X-Trace-ID propagation (FEAT-002).
-// CollectEvents fetches recent events via Herald (ADR-039).
+// CollectEvents fetches recent events via Herald and computes EventMetrics.
 func (c *NexusCollector) CollectEvents(ctx context.Context, traceID string) snapshot.EventMetrics {
 	empty := snapshot.EventMetrics{ByComponent: map[string]int{}, ByOutcome: map[string]int{}}
-	evts, err := c.heraldClient.Events().Since(ctx, c.lastEventID, nexusEventLimit)
+
+	evts, err := c.nexus.Events().Since(ctx, c.lastEventID, nexusEventLimit)
 	if err != nil {
 		return empty
 	}
-	// Convert accord.EventDTO to the internal row shape aggregateEvents expects.
-	rows := make([]struct {
-		ID        int64  `json:"id"`
-		Type      string `json:"type"`
-		Component string `json:"component"`
-		Outcome   string `json:"outcome"`
-		CreatedAt string `json:"created_at"`
-	}, len(evts))
-	for i, e := range evts {
-		rows[i].ID = e.ID
-		rows[i].Type = e.Type
-		rows[i].Component = e.Component
-		rows[i].Outcome = e.Outcome
-		rows[i].CreatedAt = e.CreatedAt
-	}
-	return c.aggregateEvents(rows)
-}
 
-// aggregateEvents computes EventMetrics from decoded event rows.
-// Updates lastEventID as a side effect.
-func (c *NexusCollector) aggregateEvents(rows []struct {
-	ID        int64  `json:"id"`
-	Type      string `json:"type"`
-	Component string `json:"component"`
-	Outcome   string `json:"outcome"`
-	CreatedAt string `json:"created_at"`
-}) snapshot.EventMetrics {
 	m := snapshot.EventMetrics{ByComponent: map[string]int{}, ByOutcome: map[string]int{}}
 	cutoff := time.Now().UTC().Add(-time.Duration(crashWindowMins) * time.Minute)
 
-	for _, e := range rows {
+	for _, e := range evts {
 		if e.ID > c.lastEventID {
 			c.lastEventID = e.ID
 		}
@@ -132,10 +75,7 @@ func (c *NexusCollector) aggregateEvents(rows []struct {
 		}
 		ts, err := time.Parse(time.RFC3339Nano, e.CreatedAt)
 		if err != nil {
-			ts, err = time.Parse(time.RFC3339, e.CreatedAt)
-			if err != nil {
-				ts = time.Time{}
-			}
+			ts, _ = time.Parse(time.RFC3339, e.CreatedAt)
 		}
 		if ts.After(cutoff) {
 			switch e.Type {
@@ -150,27 +90,3 @@ func (c *NexusCollector) aggregateEvents(rows []struct {
 	}
 	return m
 }
-
-// get performs an authenticated GET against the Nexus API.
-func (c *NexusCollector) get(ctx context.Context, path, traceID string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	if c.serviceToken != "" && path != "/health" {
-		req.Header.Set(identity.ServiceTokenHeader, c.serviceToken)
-	}
-	if traceID != "" {
-		req.Header.Set(identity.TraceIDHeader, traceID)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, fmt.Errorf("nexus: HTTP %d for %s", resp.StatusCode, path)
-	}
-	return resp, nil
-}
-
