@@ -7,13 +7,13 @@ package collector
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/Harshmaury/Canon/events"
 	"github.com/Harshmaury/Canon/identity"
 	"github.com/Harshmaury/Metrics/internal/snapshot"
+	herald "github.com/Harshmaury/Herald/client"
 )
 
 const (
@@ -23,10 +23,12 @@ const (
 )
 
 // NexusCollector polls Nexus /events and /metrics.
+// ADR-039: events polling uses Herald; /metrics uses raw HTTP (no Herald client yet).
 type NexusCollector struct {
 	baseURL      string
 	serviceToken string
 	httpClient   *http.Client
+	heraldClient *herald.Client
 	lastEventID  int64
 }
 
@@ -36,6 +38,7 @@ func NewNexusCollector(baseURL, serviceToken string) *NexusCollector {
 		baseURL:      baseURL,
 		serviceToken: serviceToken,
 		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		heraldClient: herald.New(baseURL, herald.WithToken(serviceToken)),
 	}
 }
 
@@ -78,29 +81,29 @@ func parseNexusMetrics(resp *http.Response) snapshot.NexusMetrics {
 
 // CollectEvents fetches recent events from GET /events?since=<id>.
 // traceID is the collection-cycle trace ID for X-Trace-ID propagation (FEAT-002).
+// CollectEvents fetches recent events via Herald (ADR-039).
 func (c *NexusCollector) CollectEvents(ctx context.Context, traceID string) snapshot.EventMetrics {
 	empty := snapshot.EventMetrics{ByComponent: map[string]int{}, ByOutcome: map[string]int{}}
-	path := fmt.Sprintf("/events?since=%d&limit=%d", c.lastEventID, nexusEventLimit)
-	resp, err := c.get(ctx, path, traceID)
+	evts, err := c.heraldClient.Events().Since(ctx, c.lastEventID, nexusEventLimit)
 	if err != nil {
 		return empty
 	}
-	defer resp.Body.Close()
-
-	var envelope struct {
-		OK   bool `json:"ok"`
-		Data []struct {
-			ID        int64  `json:"id"`
-			Type      string `json:"type"`
-			Component string `json:"component"`
-			Outcome   string `json:"outcome"`
-			CreatedAt string `json:"created_at"`
-		} `json:"data"`
+	// Convert accord.EventDTO to the internal row shape aggregateEvents expects.
+	rows := make([]struct {
+		ID        int64  `json:"id"`
+		Type      string `json:"type"`
+		Component string `json:"component"`
+		Outcome   string `json:"outcome"`
+		CreatedAt string `json:"created_at"`
+	}, len(evts))
+	for i, e := range evts {
+		rows[i].ID = e.ID
+		rows[i].Type = e.Type
+		rows[i].Component = e.Component
+		rows[i].Outcome = e.Outcome
+		rows[i].CreatedAt = e.CreatedAt
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return empty
-	}
-	return c.aggregateEvents(envelope.Data)
+	return c.aggregateEvents(rows)
 }
 
 // aggregateEvents computes EventMetrics from decoded event rows.
